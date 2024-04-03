@@ -39,6 +39,9 @@
 #elif defined(__FreeBSD__)
 #include <malloc_np.h>
 #endif
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #include "cutils.h"
 #include "quickjs-libc.h"
@@ -66,6 +69,7 @@ static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
             js_module_set_import_meta(ctx, val, TRUE, TRUE);
             val = JS_EvalFunction(ctx, val);
         }
+        //This was removed in the original code
         val = js_std_await(ctx, val);
     } else {
         val = JS_Eval(ctx, buf, buf_len, filename, eval_flags);
@@ -85,7 +89,7 @@ static int eval_file(JSContext *ctx, const char *filename, int module)
     uint8_t *buf;
     int ret, eval_flags;
     size_t buf_len;
-
+    
     buf = js_load_file(ctx, &buf_len, filename);
     if (!buf) {
         perror(filename);
@@ -143,19 +147,19 @@ static inline unsigned long long js_trace_malloc_ptr_offset(uint8_t *ptr,
 }
 
 /* default memory allocation functions with memory limitation */
-static size_t js_trace_malloc_usable_size(const void *ptr)
+static inline size_t js_trace_malloc_usable_size(void *ptr)
 {
 #if defined(__APPLE__)
     return malloc_size(ptr);
 #elif defined(_WIN32)
-    return _msize((void *)ptr);
+    return _msize(ptr);
 #elif defined(EMSCRIPTEN)
     return 0;
 #elif defined(__linux__)
-    return malloc_usable_size((void *)ptr);
+    return malloc_usable_size(ptr);
 #else
     /* change this to `return 0;` if compilation fails */
-    return malloc_usable_size((void *)ptr);
+    return malloc_usable_size(ptr);
 #endif
 }
 
@@ -267,10 +271,103 @@ static const JSMallocFunctions trace_mf = {
     js_trace_malloc,
     js_trace_free,
     js_trace_realloc,
-    js_trace_malloc_usable_size,
+#if defined(__APPLE__)
+    malloc_size,
+#elif defined(_WIN32)
+    (size_t (*)(const void *))_msize,
+#elif defined(EMSCRIPTEN)
+    NULL,
+#elif defined(__linux__)
+    (size_t (*)(const void *))malloc_usable_size,
+#else
+    /* change this to `NULL,` if compilation fails */
+    malloc_usable_size,
+#endif
 };
 
 #define PROG_NAME "qjs"
+
+//
+// BEGIN FUZZING CODE
+//
+
+#define REPRL_CRFD 100
+#define REPRL_CWFD 101
+#define REPRL_DRFD 102
+#define REPRL_DWFD 103
+
+#define SHM_SIZE 0x100000
+#define MAX_EDGES ((SHM_SIZE - 4) * 8)
+
+#define CHECK(cond) if (!(cond)) { fprintf(stderr, "\"" #cond "\" failed\n"); _exit(-1); }
+
+struct shmem_data {
+    uint32_t num_edges;
+    unsigned char edges[];
+};
+
+struct shmem_data* __shmem;
+uint32_t *__edges_start, *__edges_stop;
+
+void __sanitizer_cov_reset_edgeguards() {
+    uint64_t N = 0;
+    for (uint32_t *x = __edges_start; x < __edges_stop && N < MAX_EDGES; x++)
+        *x = ++N;
+}
+
+void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
+    // Avoid duplicate initialization
+    if (start == stop || *start)
+        return;
+
+    if (__edges_start != NULL || __edges_stop != NULL) {
+        fprintf(stderr, "Coverage instrumentation is only supported for a single module\n");
+        _exit(-1);
+    }
+
+    __edges_start = start;
+    __edges_stop = stop;
+
+    // Map the shared memory region
+    const char* shm_key = getenv("SHM_ID");
+    if (!shm_key) {
+        puts("[COV] no shared memory bitmap available, skipping");
+        __shmem = (struct shmem_data*) malloc(SHM_SIZE);
+    } else {
+        int fd = shm_open(shm_key, O_RDWR, S_IREAD | S_IWRITE);
+        if (fd <= -1) {
+            fprintf(stderr, "Failed to open shared memory region: %s\n", strerror(errno));
+            _exit(-1);
+        }
+
+        __shmem = (struct shmem_data*) mmap(0, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (__shmem == MAP_FAILED) {
+            fprintf(stderr, "Failed to mmap shared memory region\n");
+            _exit(-1);
+        }
+    }
+
+    __sanitizer_cov_reset_edgeguards();
+
+    __shmem->num_edges = stop - start;
+    printf("[COV] edge counters initialized. Shared memory: %s with %u edges\n", shm_key, __shmem->num_edges);
+}
+
+void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
+    // There's a small race condition here: if this function executes in two threads for the same
+    // edge at the same time, the first thread might disable the edge (by setting the guard to zero)
+    // before the second thread fetches the guard value (and thus the index). However, our
+    // instrumentation ignores the first edge (see libcoverage.c) and so the race is unproblematic.
+    uint32_t index = *guard;
+    // If this function is called before coverage instrumentation is properly initialized we want to return early.
+    if (!index) return;
+    __shmem->edges[index / 8] |= 1 << (index % 8);
+    *guard = 0;
+}
+
+//
+// END FUZZING CODE
+//
 
 void help(void)
 {
@@ -303,7 +400,7 @@ int main(int argc, char **argv)
     struct trace_malloc_data trace_data = { NULL };
     int optind;
     char *expr = NULL;
-    int interactive = 0;
+    int interactive = 1;
     int dump_memory = 0;
     int trace_memory = 0;
     int empty_run = 0;
@@ -317,7 +414,10 @@ int main(int argc, char **argv)
     int load_jscalc;
 #endif
     size_t stack_size = 0;
-
+    BOOL reprl_mode = FALSE;
+    int status = 0;
+    int result = EXIT_SUCCESS;
+    
 #ifdef CONFIG_BIGNUM
     /* load jscalc runtime if invoked as 'qjscalc' */
     {
@@ -329,7 +429,7 @@ int main(int argc, char **argv)
         load_jscalc = !strcmp(exename, "qjscalc");
     }
 #endif
-
+    
     /* cannot use getopt because we want to pass the command line to
        the script */
     optind = 1;
@@ -437,12 +537,29 @@ int main(int argc, char **argv)
                 stack_size = (size_t)strtod(argv[optind++], NULL);
                 continue;
             }
+            if (opt == 'r' || !strcmp(longopt, "reprl")) {
+                reprl_mode = TRUE;
+                continue;
+            }
             if (opt) {
                 fprintf(stderr, "qjs: unknown option '-%c'\n", opt);
             } else {
                 fprintf(stderr, "qjs: unknown option '--%s'\n", longopt);
             }
             help();
+        }
+    }
+
+    if (reprl_mode) {
+        char helo[] = "HELO";
+        if (write(REPRL_CWFD, helo, 4) != 4 || read(REPRL_CRFD, helo, 4) != 4) {
+            printf("Invalid HELO response from parent\n");
+            reprl_mode = FALSE;
+        }
+
+        if (memcmp(helo, "HELO", 4) != 0) {
+            printf("Invalid response from parent\n");
+            _exit(-1);
         }
     }
 
@@ -503,25 +620,65 @@ int main(int argc, char **argv)
                 goto fail;
         }
 
-        if (expr) {
-            if (eval_buf(ctx, expr, strlen(expr), "<cmdline>", 0))
-                goto fail;
-        } else
-        if (optind >= argc) {
-            /* interactive mode */
-            interactive = 1;
-        } else {
-            const char *filename;
-            filename = argv[optind];
-            if (eval_file(ctx, filename, module))
-                goto fail;
-        }
-        if (interactive) {
-            js_std_eval_binary(ctx, qjsc_repl, qjsc_repl_size, 0);
-        }
-        js_std_loop(ctx);
-    }
+        if (reprl_mode) {
+            do {
+                size_t script_size = 0;
+                unsigned action;
+                CHECK(read(REPRL_CRFD, &action, 4) == 4);
+                if (action == 'cexe') {
+                    CHECK(read(REPRL_CRFD, &script_size, 8) == 8);
+                } else {
+                    fprintf(stderr, "Unknown action: %u\n", action);
+                    _exit(-1);
+                }
+                char *script_src = (char *)(js_malloc(ctx, script_size+1));
 
+                char *ptr = script_src;
+                size_t remaining = script_size;
+                while (remaining > 0) {
+                    ssize_t rv = read(REPRL_DRFD, ptr, remaining);
+                    if (rv <= 0) {
+                        fprintf(stderr, "Failed to load script\n");
+                        _exit(-1);
+                    }
+                    remaining -= rv;
+                    ptr += rv;
+                }
+                script_src[script_size] = '\0';
+                if (0 == (result = eval_buf(ctx, script_src, script_size, "reprl", 0))) {
+                    js_std_loop(ctx);
+                } else {
+                    fprintf(stderr, "Failed to eval_buf reprl\n");
+                }
+                js_free(ctx, script_src);
+                fflush(stdout);
+                fflush(stderr);
+                // Send return code to parent and reset edge counters.
+                status = (result & 0xff) << 8;
+                CHECK(write(REPRL_CWFD, &status, 4) == 4);
+                __sanitizer_cov_reset_edgeguards();
+            } while (reprl_mode);
+        } else {
+            if (expr) {
+                if (eval_buf(ctx, expr, strlen(expr), "<cmdline>", 0))
+                    goto fail;
+            } else
+            if (optind >= argc) {
+                /* interactive mode */
+                interactive = 1;
+            } else {
+                const char *filename;
+                filename = argv[optind];
+                if (eval_file(ctx, filename, module))
+                    goto fail;
+            }
+            if (interactive) {
+                js_std_eval_binary(ctx, qjsc_repl, qjsc_repl_size, 0);
+            }
+            js_std_loop(ctx);
+        }
+    }
+    
     if (dump_memory) {
         JSMemoryUsage stats;
         JS_ComputeMemoryUsage(rt, &stats);

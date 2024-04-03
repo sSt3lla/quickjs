@@ -49406,11 +49406,54 @@ static JSValue js_global_unescape(JSContext *ctx, JSValueConst this_val,
 
 /* global object */
 
+#define REPRL_DWFD 103
+static JSValue js_fuzzilli(JSContext *ctx, JSValueConst this_val, int argc,
+                           JSValueConst *argv) {
+    const char* str = JS_ToCString(ctx, argv[0]);
+    if (!str) {
+        return JS_FALSE;
+    }
+    if (!strcmp(str, "FUZZILLI_CRASH")) {
+        int type;
+        if (JS_ToInt32(ctx, &type, argv[1])) {
+            JS_FreeCString(ctx, str);
+            return JS_FALSE;
+        }
+        switch (type) {
+        case 0:
+            *((int*)0x41414141) = 0x1337;
+            break;
+        case 1:
+            assert(0);
+            break;
+        default:
+            assert(0);
+            break;
+        }
+    } else if (!strcmp(str, "FUZZILLI_PRINT") && argc > 1) {
+        FILE* fzliout = fdopen(REPRL_DWFD, "w");
+        if (!fzliout) {
+            fprintf(stderr, "Fuzzer output channel not available, printing to stdout instead\n");
+            fzliout = stdout;
+        }
+        const char* print_str = JS_ToCString(ctx, argv[1]);
+        if (print_str) {
+            fprintf(fzliout, "%s\n", print_str);
+            JS_FreeCString(ctx, print_str);
+        }
+        fflush(fzliout);
+    }
+    JS_FreeCString(ctx, str);
+    return JS_TRUE;
+}
+
 static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("parseInt", 2, js_parseInt ),
     JS_CFUNC_DEF("parseFloat", 1, js_parseFloat ),
     JS_CFUNC_DEF("isNaN", 1, js_global_isNaN ),
     JS_CFUNC_DEF("isFinite", 1, js_global_isFinite ),
+
+    JS_CFUNC_DEF("fuzzilli", 2, js_fuzzilli),
 
     JS_CFUNC_MAGIC_DEF("decodeURI", 1, js_global_decodeURI, 0 ),
     JS_CFUNC_MAGIC_DEF("decodeURIComponent", 1, js_global_decodeURI, 1 ),

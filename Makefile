@@ -45,7 +45,7 @@ PREFIX?=/usr/local
 # use the gprof profiler
 #CONFIG_PROFILE=y
 # use address sanitizer
-#CONFIG_ASAN=y
+CONFIG_ASAN=y
 # use memory sanitizer
 #CONFIG_MSAN=y
 # use UB sanitizer
@@ -66,11 +66,11 @@ ifdef CONFIG_UBSAN
 OBJDIR:=$(OBJDIR)/ubsan
 endif
 
-ifdef CONFIG_DARWIN
+# ifdef CONFIG_DARWIN
 # use clang instead of gcc
 CONFIG_CLANG=y
 CONFIG_DEFAULT_AR=y
-endif
+# endif
 ifdef CONFIG_FREEBSD
 # use clang instead of gcc
 CONFIG_CLANG=y
@@ -101,6 +101,7 @@ ifdef CONFIG_CLANG
   CFLAGS += -Wunused -Wno-unused-parameter
   CFLAGS += -Wwrite-strings
   CFLAGS += -Wchar-subscripts -funsigned-char
+  CFLAGS += -fsanitize-coverage=trace-pc-guard
   CFLAGS += -MMD -MF $(OBJDIR)/$(@F).d
   ifdef CONFIG_DEFAULT_AR
     AR=$(CROSS_PREFIX)ar
@@ -148,6 +149,7 @@ CFLAGS_DEBUG=$(CFLAGS) -O0
 CFLAGS_SMALL=$(CFLAGS) -Os
 CFLAGS_OPT=$(CFLAGS) -O2
 CFLAGS_NOLTO:=$(CFLAGS_OPT)
+LDFLAGS=-g -fsanitize-coverage=trace-pc-guard
 ifdef CONFIG_COSMO
 LDFLAGS+=-s # better to strip by default
 else
