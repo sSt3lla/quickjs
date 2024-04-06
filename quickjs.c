@@ -49447,6 +49447,11 @@ static JSValue js_fuzzilli(JSContext *ctx, JSValueConst this_val, int argc,
     return JS_TRUE;
 }
 
+static JSValue js_gc(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    JS_RunGC(ctx->rt);
+    return JS_UNDEFINED;
+}
+
 static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("parseInt", 2, js_parseInt ),
     JS_CFUNC_DEF("parseFloat", 1, js_parseFloat ),
@@ -49454,6 +49459,7 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("isFinite", 1, js_global_isFinite ),
 
     JS_CFUNC_DEF("fuzzilli", 2, js_fuzzilli),
+    JS_CFUNC_DEF("gc", 0, js_gc),
 
     JS_CFUNC_MAGIC_DEF("decodeURI", 1, js_global_decodeURI, 0 ),
     JS_CFUNC_MAGIC_DEF("decodeURIComponent", 1, js_global_decodeURI, 1 ),
